@@ -1,0 +1,9 @@
+matplotlib
+tqdm
+open3d
+trimesh
+scipy
+h5py
+Ninja
+easydict
+tensorboardX

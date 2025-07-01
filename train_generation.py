@@ -5,12 +5,17 @@ import torch.utils.data
 
 import argparse
 from torch.distributions import Normal
-
-from utils.file_utils import *
-from utils.visualize import *
+import numpy as np
+import os
+import easydict
+from utils.file_utils import get_output_dir, setup_output_subdirs, copy_source, setup_logging, set_seed
+from utils.visualize import visualize_pointcloud_batch
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
 from datasets.shapenet_data_pc import ShapeNet15kPointClouds
+from datasets.bio_data_pc import SMLMDataset
+from tensorboardX import SummaryWriter
+
 
 '''
 some utils
@@ -375,18 +380,50 @@ class GaussianDiffusion:
 
 
 class PVCNN2(PVCNN2Base):
+    # TODO: expand voxel resolution
+    # # x1: original
     sa_blocks = [
         ((32, 2, 32), (1024, 0.1, 32, (32, 64))),
         ((64, 3, 16), (256, 0.2, 32, (64, 128))),
         ((128, 3, 8), (64, 0.4, 32, (128, 256))),
         (None, (16, 0.8, 32, (256, 256, 512))),
-    ]
+    ] # (voxel, point) -> (c_out, num_kernel, resolution), (npoint, radius, nsample, mlp_channels)
     fp_blocks = [
         ((256, 256), (256, 3, 8)),
         ((256, 256), (256, 3, 8)),
         ((256, 128), (128, 2, 16)),
         ((128, 128, 64), (64, 2, 32)),
-    ]
+    ] # (point, voxel) -> (mlp_channels), (c_out, num_kernel, resolution)
+    
+    # # x2
+    # sa_blocks = [
+    #     ((32, 2, 64), (1024, 0.1, 32, (32, 64))),
+    #     ((64, 3, 32), (256, 0.2, 32, (64, 128))),
+    #     ((128, 3, 16), (64, 0.4, 32, (128, 256))),
+    #     (None, (16, 0.8, 32, (256, 256, 512))),
+    # ] # (voxel, point) -> (c_out, num_kernel, resolution), (npoint, radius, nsample, mlp_channels)
+    # fp_blocks = [
+    #     ((256, 256), (256, 3, 16)),
+    #     ((256, 256), (256, 3, 16)),
+    #     ((256, 128), (128, 2, 32)),
+    #     ((128, 128, 64), (64, 2, 64)),
+    # ] # (point, voxel) -> (mlp_channels), (c_out, num_kernel, resolution)
+
+    # # x3 more layers
+    # sa_blocks = [
+    #     ((16, 2, 128), (1024, 0.1, 32, (16, 32))),
+    #     ((32, 2, 64), (512, 0.2, 32, (32, 64))),
+    #     ((64, 2, 32), (256, 0.4, 32, (64, 128))),
+    #     ((128, 2, 16), (64, 0.6, 32, (128, 256))),
+    #     (None, (16, 0.8, 32, (256, 512))),
+    # ] # (voxel, point) -> (c_out, num_kernel, resolution), (npoint, radius, nsample, mlp_channels)
+    # fp_blocks = [
+    #     ((256, 256), (256, 2, 16)),
+    #     ((256, 256), (256, 2, 16)),
+    #     ((256, 128), (128, 2, 32)),
+    #     ((128, 64), (64, 2, 64)),
+    #     ((64, 32), (32, 2, 128)),
+    # ] # (point, voxel) -> (mlp_channels), (c_out, num_kernel, resolution)
 
     def __init__(self, num_classes, embed_dim, use_att,dropout, extra_feature_channels=3, width_multiplier=1,
                  voxel_resolution_multiplier=1):
@@ -487,26 +524,21 @@ def get_betas(schedule_type, b_start, b_end, time_num):
     return betas
 
 
-def get_dataset(dataroot, npoints,category):
-    tr_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-        categories=[category], split='train',
-        tr_sample_size=npoints,
-        te_sample_size=npoints,
-        scale=1.,
-        normalize_per_shape=False,
-        normalize_std_per_axis=False,
-        random_subsample=True)
-    te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
-        categories=[category], split='val',
-        tr_sample_size=npoints,
-        te_sample_size=npoints,
-        scale=1.,
-        normalize_per_shape=False,
-        normalize_std_per_axis=False,
-        all_points_mean=tr_dataset.all_points_mean,
-        all_points_std=tr_dataset.all_points_std,
-    )
-    return tr_dataset, te_dataset
+def get_dataset(opt, cfg):
+    tr_dataset = SMLMDataset(cfg, split='train', fast_dev_run=opt.fast_dev_run, input_dim=opt.nc)
+
+    # te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
+    #     categories=[category], split='val',
+    #     tr_sample_size=npoints,
+    #     te_sample_size=npoints,
+    #     scale=1.,
+    #     normalize_per_shape=False,
+    #     normalize_std_per_axis=False,
+    #     all_points_mean=tr_dataset.all_points_mean,
+    #     all_points_std=tr_dataset.all_points_std,
+    # )
+    # return tr_dataset, te_dataset
+    return tr_dataset
 
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
@@ -541,10 +573,13 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def train(gpu, opt, output_dir, noises_init):
+def train(gpu, opt, output_dir, noises_init, cfg, train_dataset):
 
     set_seed(opt)
     logger = setup_logging(output_dir)
+    writer = SummaryWriter(output_dir)
+    
+    # ---dist---
     if opt.distribution_type == 'multi':
         should_diag = gpu==0
     else:
@@ -567,12 +602,11 @@ def train(gpu, opt, output_dir, noises_init):
         opt.saveIter =  int(opt.saveIter / opt.ngpus_per_node)
         opt.diagIter = int(opt.diagIter / opt.ngpus_per_node)
         opt.vizIter = int(opt.vizIter / opt.ngpus_per_node)
-
+    # ---dist end---
 
     ''' data '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
     dataloader, _, train_sampler, _ = get_dataloader(opt, train_dataset, None)
-
+    # train_sampler is None in single process
 
     '''
     create networks
@@ -608,7 +642,10 @@ def train(gpu, opt, output_dir, noises_init):
 
     optimizer= optim.Adam(model.parameters(), lr=opt.lr, weight_decay=opt.decay, betas=(opt.beta1, 0.999))
 
-    lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
+    if opt.use_scheduler:
+        lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, opt.lr_gamma)
+    else:
+        lr_scheduler = None
 
     if opt.model != '':
         ckpt = torch.load(opt.model)
@@ -626,11 +663,15 @@ def train(gpu, opt, output_dir, noises_init):
 
 
     for epoch in range(start_epoch, opt.niter):
+        avg_loss = 0
+        avg_netpNorm = 0
+        avg_netgradNorm = 0
 
         if opt.distribution_type == 'multi':
             train_sampler.set_epoch(epoch)
 
-        lr_scheduler.step(epoch)
+        if lr_scheduler is not None:
+            lr_scheduler.step(epoch)
 
         for i, data in enumerate(dataloader):
             x = data['train_points'].transpose(1,2)
@@ -657,6 +698,9 @@ def train(gpu, opt, output_dir, noises_init):
 
             optimizer.step()
 
+            avg_loss += loss.item()
+            avg_netpNorm += netpNorm
+            avg_netgradNorm += netgradNorm
 
             if i % opt.print_freq == 0 and should_diag:
 
@@ -667,36 +711,52 @@ def train(gpu, opt, output_dir, noises_init):
                     netpNorm, netgradNorm,
                         ))
 
-
+        avg_loss /= i + 1
+        avg_netpNorm /= i + 1
+        avg_netgradNorm /= i + 1
         if (epoch + 1) % opt.diagIter == 0 and should_diag:
 
             logger.info('Diagnosis:')
 
-            x_range = [x.min().item(), x.max().item()]
-            kl_stats = model.all_kl(x)
-            logger.info('      [{:>3d}/{:>3d}]    '
-                         'x_range: [{:>10.4f}, {:>10.4f}],   '
-                         'total_bpd_b: {:>10.4f},    '
-                         'terms_bpd: {:>10.4f},  '
-                         'prior_bpd_b: {:>10.4f}    '
-                         'mse_bt: {:>10.4f}  '
-                .format(
-                epoch, opt.niter,
-                *x_range,
-                kl_stats['total_bpd_b'].item(),
-                kl_stats['terms_bpd'].item(), kl_stats['prior_bpd_b'].item(), kl_stats['mse_bt'].item()
-            ))
+            # x_range = [x.min().item(), x.max().item()]
+            # kl_stats = model.all_kl(x) # DONE: only mse_bt is used
+            # logger.info('      [{:>3d}/{:>3d}]    '
+            #              'x_range: [{:>10.4f}, {:>10.4f}],   '
+            #              'total_bpd_b: {:>10.4f},    '
+            #              'terms_bpd: {:>10.4f},  '
+            #              'prior_bpd_b: {:>10.4f}    '
+            #              'mse_bt: {:>10.4f}  '
+            #     .format(
+            #     epoch, opt.niter,
+            #     *x_range,
+            #     kl_stats['total_bpd_b'].item(),
+            #     kl_stats['terms_bpd'].item(), kl_stats['prior_bpd_b'].item(), kl_stats['mse_bt'].item()
+            # ))
 
+            logger.info(
+                "[{:>3d}/{:>3d}]    avg_loss: {:>10.4f},    "
+                "avg_netpNorm: {:>10.2f},   avg_netgradNorm: {:>10.2f}     ".format(
+                    epoch,
+                    opt.niter,
+                    avg_loss,
+                    avg_netpNorm,
+                    avg_netgradNorm,
+                )
+            )
+            
+            writer.add_scalar('loss', avg_loss, epoch)
+            writer.add_scalar('netpNorm', avg_netpNorm, epoch)
+            writer.add_scalar('netgradNorm', avg_netgradNorm, epoch)
 
 
         if (epoch + 1) % opt.vizIter == 0 and should_diag:
-            logger.info('Generation: eval')
+            logger.info('Generation: check to eval mode')
 
             model.eval()
             with torch.no_grad():
 
-                x_gen_eval = model.gen_samples(new_x_chain(x, 25).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=40, clip_denoised=False)
+                x_gen_eval = model.gen_samples(new_x_chain(x, 1 if opt.fast_dev_run else 4).shape, x.device, clip_denoised=False)
+                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=100, clip_denoised=False)
                 x_gen_all = torch.cat(x_gen_list, dim=0)
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
@@ -709,6 +769,11 @@ def train(gpu, opt, output_dir, noises_init):
                     epoch, opt.niter,
                     *gen_eval_range, *gen_stats,
                 ))
+                
+                writer.add_scalar('eval_gen_range_min', gen_eval_range[0], epoch)
+                writer.add_scalar('eval_gen_range_max', gen_eval_range[1], epoch)
+                writer.add_scalar('eval_gen_stats_mean', gen_stats[0], epoch)
+                writer.add_scalar('eval_gen_stats_std', gen_stats[1], epoch)
 
             visualize_pointcloud_batch('%s/epoch_%03d_samples_eval.png' % (outf_syn, epoch),
                                        x_gen_eval.transpose(1, 2), None, None,
@@ -723,15 +788,8 @@ def train(gpu, opt, output_dir, noises_init):
                                        None,
                                        None)
 
-            logger.info('Generation: train')
+            logger.info('Generation: check to train mode')
             model.train()
-
-
-
-
-
-
-
 
         if (epoch + 1) % opt.saveIter == 0:
 
@@ -745,6 +803,10 @@ def train(gpu, opt, output_dir, noises_init):
                 }
 
                 torch.save(save_dict, '%s/epoch_%d.pth' % (output_dir, epoch))
+                print('save model at epoch %d' % epoch)
+                # delete the previous epoch
+                if epoch > 0 and os.path.exists('%s/epoch_%d.pth' % (output_dir, epoch-opt.saveIter)):
+                    os.remove('%s/epoch_%d.pth' % (output_dir, epoch-opt.saveIter))
 
 
             if opt.distribution_type == 'multi':
@@ -753,22 +815,27 @@ def train(gpu, opt, output_dir, noises_init):
                 model.load_state_dict(
                     torch.load('%s/epoch_%d.pth' % (output_dir, epoch), map_location=map_location)['model_state'])
 
-    dist.destroy_process_group()
+    if opt.distribution_type == 'multi':
+        dist.destroy_process_group()
 
 def main():
-    opt = parse_args()
+    opt, cfg = parse_args()
+    # print(opt)
     if opt.category == 'airplane':
         opt.beta_start = 1e-5
         opt.beta_end = 0.008
         opt.schedule_type = 'warm0.1'
 
+    if opt.fast_dev_run:
+        print("Fast dev run enabled!")
+
     exp_id = os.path.splitext(os.path.basename(__file__))[0]
     dir_id = os.path.dirname(__file__)
     output_dir = get_output_dir(dir_id, exp_id)
-    copy_source(__file__, output_dir)
+    # copy_source(__file__, output_dir)
 
     ''' workaround '''
-    train_dataset, _ = get_dataset(opt.dataroot, opt.npoints, opt.category)
+    train_dataset = get_dataset(opt, cfg)
     noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
 
     if opt.dist_url == "env://" and opt.world_size == -1:
@@ -777,21 +844,26 @@ def main():
     if opt.distribution_type == 'multi':
         opt.ngpus_per_node = torch.cuda.device_count()
         opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init))
+        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init, cfg, train_dataset))
     else:
-        train(opt.gpu, opt, output_dir, noises_init)
+        train(opt.gpu, opt, output_dir, noises_init, cfg, train_dataset)
 
 
 
 def parse_args():
+    
+    # ---opt---
+    
+    fast_dev_run = True
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataroot', default='ShapeNetCore.v2.PC15k/')
-    parser.add_argument('--category', default='chair')
+    parser.add_argument('--dataroot', default='/repos/datasets/smlm_pc')
+    parser.add_argument('--category', default='mito_pc_16384_2048.h5')
+    parser.add_argument('--fast_dev_run', action='store_true', default=fast_dev_run)
 
-    parser.add_argument('--bs', type=int, default=16, help='input batch size')
-    parser.add_argument('--workers', type=int, default=16, help='workers')
-    parser.add_argument('--niter', type=int, default=10000, help='number of epochs to train for')
+    parser.add_argument('--bs', type=int, default=2 if fast_dev_run else 2, help='input batch size')
+    parser.add_argument('--workers', type=int, default=1 if fast_dev_run else 1, help='workers')
+    parser.add_argument('--niter', type=int, default=10000 if not fast_dev_run else 3, help='number of epochs to train for')
 
     parser.add_argument('--nc', default=3)
     parser.add_argument('--npoints', default=2048)
@@ -802,18 +874,20 @@ def parse_args():
     parser.add_argument('--time_num', default=1000)
 
     #params
-    parser.add_argument('--attention', default=True)
-    parser.add_argument('--dropout', default=0.1)
+    # DONE: close attention for memory saving
+    parser.add_argument('--attention', default=False)
+    parser.add_argument('--dropout', default=0.0)
     parser.add_argument('--embed_dim', type=int, default=64)
     parser.add_argument('--loss_type', default='mse')
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
 
-    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=0.0002')
+    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=2e-4')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
     parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
     parser.add_argument('--lr_gamma', type=float, default=0.998, help='lr decay for EBM')
+    parser.add_argument('--use_scheduler', action='store_true', default=False, help='use scheduler')
 
     parser.add_argument('--model', default='', help="path to model (to continue training)")
 
@@ -832,21 +906,33 @@ def parse_args():
                              'multi node data parallel training')
     parser.add_argument('--rank', default=0, type=int,
                         help='node rank for distributed training')
-    parser.add_argument('--gpu', default=None, type=int,
+    parser.add_argument('--gpu', default=0, type=int,
                         help='GPU id to use. None means using all available GPUs.')
 
     '''eval'''
-    parser.add_argument('--saveIter', default=100, help='unit: epoch')
-    parser.add_argument('--diagIter', default=50, help='unit: epoch')
-    parser.add_argument('--vizIter', default=50, help='unit: epoch')
-    parser.add_argument('--print_freq', default=50, help='unit: iter')
+    parser.add_argument('--saveIter', default=1 if fast_dev_run else 50, help='unit: epoch')
+    parser.add_argument('--diagIter', default=1 if fast_dev_run else 10, help='unit: epoch')
+    parser.add_argument('--vizIter', default=1 if fast_dev_run else 50, help='unit: epoch')
+    parser.add_argument('--print_freq', default=1 if fast_dev_run else 1, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
 
 
     opt = parser.parse_args()
+    
+    # ---cfg---
+    cfg = easydict.EasyDict()
+    cfg.dataset_name = opt.category if opt.category.endswith('.h5') else opt.category+'.h5'
+    cfg.tr_max_sample_points = opt.npoints
+    cfg.te_max_sample_points = opt.npoints
+    cfg.dataset_scale = 0.9
+    cfg.is_scale_z = False
+    cfg.is_random_sample = True
+    cfg.transforms = None
+    cfg.noise_points_ratio = 0.0
+    cfg.data_dir = opt.dataroot
 
-    return opt
+    return opt, cfg
 
 if __name__ == '__main__':
     main()

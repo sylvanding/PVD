@@ -9,6 +9,30 @@ Implementation of Shape Generation and Completion Through Point-Voxel Diffusion
 
 [Linqi Zhou](https://alexzhou907.github.io), [Yilun Du](https://yilundu.github.io/), [Jiajun Wu](https://jiajunwu.com/)
 
+## Setup
+
+```bash
+# Example of py39, cu118 for RTX 3060
+conda create -n pvd python=3.9 -y
+conda activate pvd
+pip install torch==2.2.1 torchvision==0.17.1  --index-url https://download.pytorch.org/whl/cu118
+
+pip install -r requirements.txt
+
+# Install PVCNN backend
+pip install . --no-build-isolation
+## clean build
+## python setup.py clean
+
+# Install PyTorchEMD
+cd metrics/PyTorchEMD
+python setup.py install
+cp build/**/emd_cuda.cpython-39-x86_64-linux-gnu.so .
+
+# for error:
+pip install --upgrade typing_extensions
+```
+
 ## Requirements:
 
 Make sure the following environments are installed.
@@ -29,7 +53,7 @@ Install PyTorchEMD by
 ```
 cd metrics/PyTorchEMD
 python setup.py install
-cp build/**/emd_cuda.cpython-36m-x86_64-linux-gnu.so .
+cp build/**/emd_cuda.cpython-39-x86_64-linux-gnu.so .
 ```
 
 The code was tested on Unbuntu with Titan RTX. 

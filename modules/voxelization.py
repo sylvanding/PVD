@@ -15,6 +15,7 @@ class Voxelization(nn.Module):
 
     def forward(self, features, coords):
         coords = coords.detach()
+        # normalize coords to [0, 1]
         norm_coords = coords - coords.mean(2, keepdim=True)
         if self.normalize:
             norm_coords = norm_coords / (norm_coords.norm(dim=1, keepdim=True).max(dim=2, keepdim=True).values * 2.0 + self.eps) + 0.5

@@ -82,6 +82,7 @@ class PointNetSAModule(nn.Module):
         centers_coords = F.furthest_point_sample(coords, self.num_centers)
         features_list = []
         for grouper, mlp in zip(self.groupers, self.mlps):
+            # fuse local point features with voxel features
             features, temb = mlp(grouper(coords, centers_coords, temb, features))
             features_list.append(features.max(dim=-1).values)
         if len(features_list) > 1:
