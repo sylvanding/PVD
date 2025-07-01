@@ -82,7 +82,7 @@ class PVConv(nn.Module):
             nn.GroupNorm(num_groups=8, num_channels=out_channels),
             Attention(out_channels, 8) if attention else Swish()
         ]
-        if with_se:
+        if with_se and attention:
             voxel_layers.append(SE3d(out_channels, use_relu=with_se_relu))
         self.voxel_layers = nn.Sequential(*voxel_layers)
         self.point_features = SharedMLP(in_channels, out_channels)
@@ -92,6 +92,7 @@ class PVConv(nn.Module):
         voxel_features, voxel_coords = self.voxelization(features, coords)
         voxel_features = self.voxel_layers(voxel_features)
         voxel_features = F.trilinear_devoxelize(voxel_features, voxel_coords, self.resolution, self.training)
+        # TODO: another way to fuse features (concat)
         fused_features = voxel_features + self.point_features(features)
         return fused_features, coords, temb
 
@@ -118,7 +119,7 @@ class PVConvReLU(nn.Module):
             nn.BatchNorm3d(out_channels),
             Attention(out_channels, 8) if attention else nn.LeakyReLU(leak, True)
         ]
-        if with_se:
+        if with_se and attention:
             voxel_layers.append(SE3d(out_channels, use_relu=with_se_relu))
         self.voxel_layers = nn.Sequential(*voxel_layers)
         self.point_features = SharedMLP(in_channels, out_channels)

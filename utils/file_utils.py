@@ -1,5 +1,6 @@
 import os
 import random
+import shutil
 import sys
 
 from shutil import copyfile
@@ -44,10 +45,14 @@ def setup_logging(output_dir):
 
 
 def get_output_dir(prefix, exp_id):
-    t = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-    output_dir = os.path.join(prefix, 'output/' + exp_id, t)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    # t = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+    # output_dir = os.path.join(prefix, 'output/' + exp_id, t)
+    output_dir = os.path.join(prefix, 'output', exp_id)
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+        print(f"Removing existing output directory: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"Output directory: {output_dir}")
     return output_dir
 
 
@@ -69,7 +74,7 @@ def setup_output_subdirs(output_dir, *subfolders):
 
     output_subdirs = output_dir
     try:
-        os.makedirs(output_subdirs)
+        os.makedirs(output_subdirs, exist_ok=True)
     except OSError:
         pass
 
@@ -77,7 +82,7 @@ def setup_output_subdirs(output_dir, *subfolders):
     for sf in subfolders:
         curr_subf = os.path.join(output_subdirs, sf)
         try:
-            os.makedirs(curr_subf)
+            os.makedirs(curr_subf, exist_ok=True)
         except OSError:
             pass
         subfolder_list.append(curr_subf)
