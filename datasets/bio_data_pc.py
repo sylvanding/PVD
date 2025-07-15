@@ -9,10 +9,12 @@ import copy
 from typing import Union, Tuple
 import h5py
 
+from utils.render import render_to_2d_image
+
 
 class SMLMDataset(Dataset):
     def __init__(self, cfg, split, fast_dev_run=False, input_dim=3):
-        assert split in ["train", "val", "test", "test-exp"], "split error value!"
+        assert split in ["train", "val", "test", "test-exp", "generate"], "split error value!"
 
         self.dataset_name = cfg.dataset_name
         self.tr_sample_size = cfg.tr_max_sample_points
@@ -27,6 +29,10 @@ class SMLMDataset(Dataset):
         self.fast_dev_run = fast_dev_run
         self.input_dim = input_dim
 
+        self.use_img_guide = cfg.get('use_img_guide', False)
+        if self.use_img_guide:
+            self.img_size = cfg.get('img_size', 64)
+
         # if self.split != "train":
         #     self.is_random_sample = False
 
@@ -36,12 +42,14 @@ class SMLMDataset(Dataset):
                 "val": [1000, 1005],
                 "test": [1001, 1002],
                 "test-exp": [0, 1],
+                "generate": [1000, 1005],
             },
             "remote": {
                 "train": [0, 1000],
                 "val": [1000, 1024],
                 "test": [1001, 1002],
                 "test-exp": [0, 1],
+                "generate": [1000, 1005],
             },
         }
         if self.split != "test-exp":
@@ -214,6 +222,24 @@ class SMLMDataset(Dataset):
         result["cate_idx"] = torch.tensor(0)
         result["sid"] = torch.tensor(0)
         result["mid"] = torch.tensor(0)
+
+        if self.use_img_guide:
+            # The point cloud is normalized to [-1, 1].
+            # We need to scale it to pixel coordinates [0, img_size].
+            points_for_render = result["train_points"].numpy()
+            points_pixel_coords = (points_for_render + 1) * self.img_size / 2
+
+            guide_image = render_to_2d_image(
+                points=points_pixel_coords,
+                image_size=(self.img_size, self.img_size),
+                psf_sigma_px=1.0, 
+                output_dtype=np.float32
+            )
+            # Normalize to [0, 1] and add channel dimension
+            if guide_image.max() > 0:
+                guide_image = guide_image / guide_image.max()
+            
+            result["guide_img"] = torch.from_numpy(guide_image).unsqueeze(0).float()
         
 
         return result

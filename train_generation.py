@@ -9,6 +9,7 @@ import numpy as np
 import os
 import easydict
 from utils.file_utils import get_output_dir, setup_output_subdirs, copy_source, setup_logging, set_seed
+from utils.render import save_image
 from utils.visualize import visualize_pointcloud_batch
 from model.pvcnn_generation import PVCNN2Base
 import torch.distributed as dist
@@ -379,6 +380,43 @@ class GaussianDiffusion:
             return total_bpd_b.mean(), vals_bt_.mean(), prior_bpd_b.mean(), mse_bt_.mean()
 
 
+class ImageEncoder(nn.Module):
+    def __init__(self, in_channels=1, out_channels_list=None):
+        super().__init__()
+        if out_channels_list is None:
+            out_channels_list = [64, 128, 256]
+        
+        self.conv_blocks = nn.ModuleList()
+        current_channels = in_channels
+        for i, out_ch in enumerate(out_channels_list):
+            self.conv_blocks.append(
+                nn.Sequential(
+                    nn.Conv2d(current_channels, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.BatchNorm2d(out_ch),
+                    nn.SiLU(),
+                    nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
+                    nn.BatchNorm2d(out_ch),
+                    nn.SiLU(),
+                    nn.AvgPool2d(kernel_size=2, stride=2)
+                )
+            )
+            current_channels = out_ch
+        # self.fc = nn.ModuleList([
+        #     nn.Linear(out_ch * 16 * 16, 1024),
+        #     nn.Linear(1024, 512),
+        #     nn.Linear(512, 256),
+        # ])
+
+    def forward(self, x):
+        features = [x]
+        for block in self.conv_blocks:
+            x = block(x)
+            features.append(x)
+        
+        global_feat = nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1)
+        return features, global_feat
+
+
 class PVCNN2(PVCNN2Base):
     # TODO: expand voxel resolution
     # # x1: original
@@ -432,15 +470,54 @@ class PVCNN2(PVCNN2Base):
             dropout=dropout, extra_feature_channels=extra_feature_channels,
             width_multiplier=width_multiplier, voxel_resolution_multiplier=voxel_resolution_multiplier
         )
+    
+    def forward(self, inputs, t, guide_features=None, global_feat=None):
+        # inputs: (B, N, 3)
+        # guide_features: list of (B, C, H, W)
+        if guide_features is not None:
+            # coords must be in range [-1, 1]
+            coords = inputs[:, :, :2].unsqueeze(1) # (B, 1, N, 2)
+            
+            point_features_list = []
+            for feat_map in guide_features:
+                # feat_map: (B, C, H, W)
+                sampled_features = nn.functional.grid_sample(
+                    feat_map, coords, mode='bilinear', padding_mode='border', align_corners=False
+                ) # (B, C, 1, N) 
+                # TODO: handle the case when coords are out of range
+                point_features_list.append(sampled_features.squeeze(2)) # (B, C, N)
+            
+            img_feats = torch.cat(point_features_list, dim=1) # (B, C_total, N)
+            
+            img_feats = img_feats.transpose(1, 2) # (B, N, C_total)
+            
+            N = inputs.shape[1]
+            global_feat_expanded = global_feat.unsqueeze(1).expand(-1, N, -1)
+            
+            inputs = torch.cat([inputs, img_feats, global_feat_expanded], dim=2).transpose(1, 2)
+            # inputs: (B, 3 + C_total, N)
+        
+        # Now call the original forward method of the base class
+        return super().forward(inputs, t)
 
 
 class Model(nn.Module):
     def __init__(self, args, betas, loss_type: str, model_mean_type: str, model_var_type:str):
         super(Model, self).__init__()
         self.diffusion = GaussianDiffusion(betas, loss_type, model_mean_type, model_var_type)
+        self.use_img_guide = args.use_img_guide
+
+        extra_feature_channels = 0
+        if self.use_img_guide:
+            out_channels_list = [32, 64, 128]
+            self.image_encoder = ImageEncoder(in_channels=1, out_channels_list=out_channels_list)
+            # local features (including original image) + global features
+            extra_feature_channels = extra_feature_channels + (1 + sum(out_channels_list)) + out_channels_list[-1]
+        else:
+            self.image_encoder = None
 
         self.model = PVCNN2(num_classes=args.nc, embed_dim=args.embed_dim, use_att=args.attention,
-                            dropout=args.dropout, extra_feature_channels=0)
+                            dropout=args.dropout, extra_feature_channels=extra_feature_channels)
 
     def prior_kl(self, x0):
         return self.diffusion._prior_bpd(x0)
@@ -456,17 +533,25 @@ class Model(nn.Module):
         }
 
 
-    def _denoise(self, data, t):
-        B, D,N= data.shape
+    def _denoise(self, data, t, guide_img=None):
+        B, D, N = data.shape
         assert data.dtype == torch.float
         assert t.shape == torch.Size([B]) and t.dtype == torch.int64
 
-        out = self.model(data, t)
+        if self.use_img_guide:
+            if guide_img is None:
+                raise ValueError("Image guide is enabled, but no guide_img provided to _denoise.")
+            guide_features, global_feat = self.image_encoder(guide_img)
+            # The forward of our modified PVCNN2 expects (B, N, 3)
+            out = self.model(data.transpose(1, 2), t, guide_features, global_feat)
+        else:
+            # The original PVCNN2Base expects (B, C, N), so we pass `data` directly
+            out = self.model(data, t)
 
         assert out.shape == torch.Size([B, D, N])
         return out
 
-    def get_loss_iter(self, data, noises=None):
+    def get_loss_iter(self, data, noises=None, guide_img=None):
         B, D, N = data.shape
         t = torch.randint(0, self.diffusion.num_timesteps, size=(B,), device=data.device)
 
@@ -474,20 +559,30 @@ class Model(nn.Module):
             noises[t!=0] = torch.randn((t!=0).sum(), *noises.shape[1:]).to(noises)
 
         losses = self.diffusion.p_losses(
-            denoise_fn=self._denoise, data_start=data, t=t, noise=noises)
+            denoise_fn=lambda data, t: self._denoise(data, t, guide_img), 
+            data_start=data, t=t, noise=noises
+        )
         assert losses.shape == t.shape == torch.Size([B])
         return losses
 
-    def gen_samples(self, shape, device, noise_fn=torch.randn,
+    def gen_samples(self, shape, device, guide_img, noise_fn=torch.randn,
                     clip_denoised=True,
                     keep_running=False):
-        return self.diffusion.p_sample_loop(self._denoise, shape=shape, device=device, noise_fn=noise_fn,
+        if self.use_img_guide and guide_img is None:
+            raise ValueError("Image guide is enabled, but no guide_img provided to gen_samples.")
+        
+        denoise_fn_wrapper = lambda data, t: self._denoise(data, t, guide_img)
+        return self.diffusion.p_sample_loop(denoise_fn_wrapper, shape=shape, device=device, noise_fn=noise_fn,
                                             clip_denoised=clip_denoised,
                                             keep_running=keep_running)
 
-    def gen_sample_traj(self, shape, device, freq, noise_fn=torch.randn,
+    def gen_sample_traj(self, shape, device, freq, guide_img, noise_fn=torch.randn,
                     clip_denoised=True,keep_running=False):
-        return self.diffusion.p_sample_loop_trajectory(self._denoise, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
+        if self.use_img_guide and guide_img is None:
+            raise ValueError("Image guide is enabled, but no guide_img provided to gen_sample_traj.")
+            
+        denoise_fn_wrapper = lambda data, t: self._denoise(data, t, guide_img)
+        return self.diffusion.p_sample_loop_trajectory(denoise_fn_wrapper, shape=shape, device=device, noise_fn=noise_fn, freq=freq,
                                                        clip_denoised=clip_denoised,
                                                        keep_running=keep_running)
 
@@ -526,7 +621,10 @@ def get_betas(schedule_type, b_start, b_end, time_num):
 
 def get_dataset(opt, cfg):
     tr_dataset = SMLMDataset(cfg, split='train', fast_dev_run=opt.fast_dev_run, input_dim=opt.nc)
-
+    if opt.use_img_guide:
+        ge_dataset = SMLMDataset(cfg, split='generate', fast_dev_run=opt.fast_dev_run, input_dim=opt.nc)
+    else:
+        ge_dataset = None
     # te_dataset = ShapeNet15kPointClouds(root_dir=dataroot,
     #     categories=[category], split='val',
     #     tr_sample_size=npoints,
@@ -538,7 +636,7 @@ def get_dataset(opt, cfg):
     #     all_points_std=tr_dataset.all_points_std,
     # )
     # return tr_dataset, te_dataset
-    return tr_dataset
+    return tr_dataset, ge_dataset
 
 
 def get_dataloader(opt, train_dataset, test_dataset=None):
@@ -573,7 +671,7 @@ def get_dataloader(opt, train_dataset, test_dataset=None):
     return train_dataloader, test_dataloader, train_sampler, test_sampler
 
 
-def train(gpu, opt, output_dir, noises_init, cfg, train_dataset):
+def train(gpu, opt, output_dir, noises_init, cfg, train_dataset, ge_dataset):
 
     set_seed(opt)
     logger = setup_logging(output_dir)
@@ -688,7 +786,12 @@ def train(gpu, opt, output_dir, noises_init, cfg, train_dataset):
                 x = x.cuda()
                 noises_batch = noises_batch.cuda()
 
-            loss = model.get_loss_iter(x, noises_batch).mean()
+            if opt.use_img_guide:
+                guide_img = data['guide_img'].cuda(gpu if gpu is not None else 0)
+                loss = model.get_loss_iter(x, noises_batch, guide_img).mean()
+            else:
+                loss = model.get_loss_iter(x, noises_batch).mean()
+
 
             optimizer.zero_grad()
             loss.backward()
@@ -754,9 +857,31 @@ def train(gpu, opt, output_dir, noises_init, cfg, train_dataset):
 
             model.eval()
             with torch.no_grad():
+                
+                sample_guide_img = None
+                if opt.use_img_guide:
+                    # guide_img comes from val dataset or train dataset
+                    sample_guide_img = torch.stack([ge_dataset[i]['guide_img'] for i in range(1 if opt.fast_dev_run else 4)], dim=0)
+                    # sample_guide_img = data['guide_img'][:1 if opt.fast_dev_run else 4]
+                    if gpu is not None:
+                        sample_guide_img = sample_guide_img.cuda(gpu)
 
-                x_gen_eval = model.gen_samples(new_x_chain(x, 1 if opt.fast_dev_run else 4).shape, x.device, clip_denoised=False)
-                x_gen_list = model.gen_sample_traj(new_x_chain(x, 1).shape, x.device, freq=100, clip_denoised=False)
+
+                x_gen_eval = model.gen_samples(
+                    new_x_chain(x, 1 if opt.fast_dev_run else 4).shape, 
+                    x.device, 
+                    guide_img=sample_guide_img,
+                    clip_denoised=False
+                )
+                
+                single_guide_img = sample_guide_img[0:1] if sample_guide_img is not None else None
+                x_gen_list = model.gen_sample_traj(
+                    new_x_chain(x, 1).shape, 
+                    x.device, 
+                    freq=100, 
+                    guide_img=single_guide_img,
+                    clip_denoised=False
+                )
                 x_gen_all = torch.cat(x_gen_list, dim=0)
 
                 gen_stats = [x_gen_eval.mean(), x_gen_eval.std()]
@@ -775,18 +900,23 @@ def train(gpu, opt, output_dir, noises_init, cfg, train_dataset):
                 writer.add_scalar('eval_gen_stats_mean', gen_stats[0], epoch)
                 writer.add_scalar('eval_gen_stats_std', gen_stats[1], epoch)
 
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval.png' % (outf_syn, epoch),
-                                       x_gen_eval.transpose(1, 2), None, None,
-                                       None)
+                if opt.use_img_guide:
+                    # save guide_img
+                    guide_img_path = '%s/epoch_%03d_guide_img.png' % (outf_syn, epoch)
+                    save_image(sample_guide_img.cpu().numpy(), guide_img_path)
+                
+                visualize_pointcloud_batch('%s/epoch_%03d_samples_eval.png' % (outf_syn, epoch),
+                                        x_gen_eval.transpose(1, 2), None, None,
+                                        None)
 
-            visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all.png' % (outf_syn, epoch),
-                                       x_gen_all.transpose(1, 2), None,
-                                       None,
-                                       None)
+                visualize_pointcloud_batch('%s/epoch_%03d_samples_eval_all.png' % (outf_syn, epoch),
+                                        x_gen_all.transpose(1, 2), None,
+                                        None,
+                                        None)
 
-            visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
-                                       None,
-                                       None)
+                visualize_pointcloud_batch('%s/epoch_%03d_x.png' % (outf_syn, epoch), x.transpose(1, 2), None,
+                                        None,
+                                        None)
 
             logger.info('Generation: check to train mode')
             model.train()
@@ -835,7 +965,7 @@ def main():
     # copy_source(__file__, output_dir)
 
     ''' workaround '''
-    train_dataset = get_dataset(opt, cfg)
+    train_dataset, ge_dataset = get_dataset(opt, cfg)
     noises_init = torch.randn(len(train_dataset), opt.npoints, opt.nc)
 
     if opt.dist_url == "env://" and opt.world_size == -1:
@@ -844,9 +974,9 @@ def main():
     if opt.distribution_type == 'multi':
         opt.ngpus_per_node = torch.cuda.device_count()
         opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init, cfg, train_dataset))
+        mp.spawn(train, nprocs=opt.ngpus_per_node, args=(opt, output_dir, noises_init, cfg, train_dataset, ge_dataset))
     else:
-        train(opt.gpu, opt, output_dir, noises_init, cfg, train_dataset)
+        train(opt.gpu, opt, output_dir, noises_init, cfg, train_dataset, ge_dataset)
 
 
 
@@ -854,14 +984,14 @@ def parse_args():
     
     # ---opt---
     
-    fast_dev_run = True
+    fast_dev_run = False
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataroot', default='/repos/datasets/smlm_pc')
     parser.add_argument('--category', default='mito_pc_16384_2048.h5')
     parser.add_argument('--fast_dev_run', action='store_true', default=fast_dev_run)
 
-    parser.add_argument('--bs', type=int, default=2 if fast_dev_run else 2, help='input batch size')
+    parser.add_argument('--bs', type=int, default=2 if fast_dev_run else 8, help='input batch size')
     parser.add_argument('--workers', type=int, default=1 if fast_dev_run else 1, help='workers')
     parser.add_argument('--niter', type=int, default=10000 if not fast_dev_run else 3, help='number of epochs to train for')
 
@@ -882,7 +1012,11 @@ def parse_args():
     parser.add_argument('--model_mean_type', default='eps')
     parser.add_argument('--model_var_type', default='fixedsmall')
 
-    parser.add_argument('--lr', type=float, default=2e-4, help='learning rate for E, default=2e-4')
+    '''image guide'''
+    parser.add_argument('--use_img_guide', action='store_true', default=True, help='use image guide')
+    parser.add_argument('--img_size', type=int, default=128, help='image size')
+
+    parser.add_argument('--lr', type=float, default=2e-1, help='learning rate for E, default=2e-4')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam. default=0.5')
     parser.add_argument('--decay', type=float, default=0, help='weight decay for EBM')
     parser.add_argument('--grad_clip', type=float, default=None, help='weight decay for EBM')
@@ -912,7 +1046,7 @@ def parse_args():
     '''eval'''
     parser.add_argument('--saveIter', default=1 if fast_dev_run else 50, help='unit: epoch')
     parser.add_argument('--diagIter', default=1 if fast_dev_run else 10, help='unit: epoch')
-    parser.add_argument('--vizIter', default=1 if fast_dev_run else 50, help='unit: epoch')
+    parser.add_argument('--vizIter', default=1 if fast_dev_run else 10, help='unit: epoch')
     parser.add_argument('--print_freq', default=1 if fast_dev_run else 1, help='unit: iter')
 
     parser.add_argument('--manualSeed', default=42, type=int, help='random seed')
@@ -931,6 +1065,14 @@ def parse_args():
     cfg.transforms = None
     cfg.noise_points_ratio = 0.0
     cfg.data_dir = opt.dataroot
+    
+    if opt.use_img_guide:
+        cfg.use_img_guide = True
+        cfg.img_size = opt.img_size
+    else:
+        cfg.use_img_guide = False
+        cfg.img_size = None
+
 
     return opt, cfg
 
